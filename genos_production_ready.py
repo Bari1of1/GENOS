@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 GENOS v3 Production - Complete System with Database, Validation, Auth & Deployment
-Ready for real deployment with Supabase backend
+Ready for real deployment with Supabase backend + Ollama for AI code generation
 """
 
 import os
@@ -13,6 +13,7 @@ from typing import Optional, List, Dict
 from datetime import datetime, timedelta
 import hashlib
 import shutil
+import requests
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,12 +29,6 @@ try:
 except ImportError:
     raise ImportError("Install: pip install supabase")
 
-# Claude
-try:
-    import anthropic
-except ImportError:
-    raise ImportError("Install: pip install anthropic")
-
 
 # ============================================================================
 # ENVIRONMENT SETUP
@@ -43,7 +38,7 @@ load_dotenv()
 
 def validate_env():
     """Validate all required environment variables"""
-    required = ["SUPABASE_URL", "SUPABASE_KEY", "CLAUDE_API_KEY"]
+    required = ["SUPABASE_URL", "SUPABASE_KEY"]
     missing = [var for var in required if not os.getenv(var)]
     
     if missing:
@@ -53,7 +48,7 @@ def validate_env():
     return {
         "SUPABASE_URL": os.getenv("SUPABASE_URL"),
         "SUPABASE_KEY": os.getenv("SUPABASE_KEY"),
-        "CLAUDE_API_KEY": os.getenv("CLAUDE_API_KEY"),
+        "OLLAMA_URL": os.getenv("OLLAMA_URL", "http://localhost:11434"),
         "JWT_SECRET": os.getenv("JWT_SECRET", hashlib.sha256(os.getenv("SUPABASE_KEY").encode()).hexdigest())
     }
 
@@ -243,46 +238,72 @@ class SandboxManager:
 
 
 class AIGenerator:
-    def __init__(self, api_key: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
+    def __init__(self, ollama_url: str = "http://localhost:11434"):
+        self.ollama_url = ollama_url
+        self.model = "codellama"
+    
+    def _check_ollama(self) -> bool:
+        """Check if Ollama is running"""
+        try:
+            response = requests.get(f"{self.ollama_url}/api/tags", timeout=2)
+            return response.status_code == 200
+        except:
+            return False
     
     def generate_project(self, spec: dict) -> dict:
-        """Generate project files with Claude"""
-        prompt = f"""
-        Generate a complete, working {spec['language']} {spec['type']} application.
+        """Generate project files with Ollama CodeLLaMA"""
         
-        Project: {spec['name']}
-        Description: {spec['description']}
-        Type: {spec['type']}
-        Frameworks: {', '.join(spec.get('frameworks', []))}
+        # Check if Ollama is running
+        if not self._check_ollama():
+            return {
+                "error": f"Ollama not running at {self.ollama_url}. Start with: ollama serve",
+                "files": {}
+            }
         
-        Return ONLY valid JSON (no markdown, no code blocks):
-        {{
-            "files": {{"path/to/file": "content", ...}},
-            "dependencies": ["dep1", "dep2"],
-            "scripts": {{"start": "...", "build": "..."}},
-            "dockerfile": "Dockerfile content",
-            "github_actions": "CI workflow"
-        }}
-        """
+        prompt = f"""Generate a complete, working {spec['language']} {spec['type']} application.
+
+Project: {spec['name']}
+Description: {spec['description']}
+Type: {spec['type']}
+Frameworks: {', '.join(spec.get('frameworks', []))}
+
+Return ONLY valid JSON (no markdown, no code blocks):
+{{
+    "files": {{"path/to/file": "content", ...}},
+    "dependencies": ["dep1", "dep2"],
+    "scripts": {{"start": "...", "build": "..."}},
+    "dockerfile": "Dockerfile content",
+    "github_actions": "CI workflow"
+}}"""
         
         try:
-            message = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=4096,
-                messages=[{"role": "user", "content": prompt}]
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "temperature": 0.7,
+                },
+                timeout=120
             )
             
-            response_text = message.content[0].text
+            if response.status_code != 200:
+                return {"error": f"Ollama error: {response.text}", "files": {}}
+            
+            response_text = response.json().get("response", "")
             json_start = response_text.find('{')
             json_end = response_text.rfind('}') + 1
             
             if json_start == -1 or json_end == 0:
-                raise ValueError("No JSON found in response")
+                return {"error": "No JSON found in response", "files": {}}
             
             return json.loads(response_text[json_start:json_end])
+        
         except json.JSONDecodeError:
             return {"error": "Invalid JSON from AI", "files": {}}
+        except requests.exceptions.Timeout:
+            return {"error": "Ollama request timed out (CodeLLaMA is slow, this is normal for large generations)", "files": {}}
         except Exception as e:
             return {"error": str(e), "files": {}}
 
@@ -305,7 +326,7 @@ app.add_middleware(
 # Initialize managers
 db = DatabaseManager(CONFIG.get("SUPABASE_URL", ""), CONFIG.get("SUPABASE_KEY", ""))
 sandbox = SandboxManager()
-ai = AIGenerator(CONFIG.get("CLAUDE_API_KEY", ""))
+ai = AIGenerator(CONFIG.get("OLLAMA_URL", "http://localhost:11434"))
 
 # Static files
 projects_dir = Path("./genos_projects")
@@ -321,6 +342,18 @@ if projects_dir.exists():
 def health():
     """Health check"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+@app.get("/health/ollama")
+def health_ollama():
+    """Check Ollama status"""
+    is_running = ai._check_ollama()
+    return {
+        "ollama_running": is_running,
+        "url": ai.ollama_url,
+        "model": ai.model,
+        "status": "ready" if is_running else "not running"
+    }
 
 
 @app.post("/api/projects")
@@ -519,11 +552,16 @@ if __name__ == "__main__":
         print("1. Create .env file with:")
         print("   SUPABASE_URL=your_url")
         print("   SUPABASE_KEY=your_key")
-        print("   CLAUDE_API_KEY=your_key\n")
+        print("   OLLAMA_URL=http://localhost:11434 (optional, defaults to localhost)\n")
+        print("2. Start Ollama:")
+        print("   ollama serve\n")
+        print("3. Pull CodeLLaMA model:")
+        print("   ollama pull codellama\n")
         exit(1)
     
     port = int(os.getenv("PORT", 8000))
     print("🧬 GENOS v3 Production Server")
     print(f"📍 http://localhost:{port}")
     print(f"📚 Docs: http://localhost:{port}/docs")
+    print(f"🤖 Ollama URL: {CONFIG.get('OLLAMA_URL', 'http://localhost:11434')}")
     uvicorn.run(app, host="0.0.0.0", port=port)
