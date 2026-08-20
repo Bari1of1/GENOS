@@ -1,0 +1,9 @@
+.env
+.env.local
+__pycache__/
+*.pyc
+venv/
+node_modules/
+genos_projects/
+genos_uploads/
+.DS_Store
